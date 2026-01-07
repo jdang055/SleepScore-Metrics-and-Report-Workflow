@@ -1,0 +1,234 @@
+{
+  "name": "TruMe BioAge + Sleep Workflow V2",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## TruMe SleepScore and BioAge Sleep Effect Workflow\n\n- The workflow checks the TruMe database for new requests marked **Todo**.\n- It triggers a Python script running through **Google Cloud**, which:\n  - Generates SleepScore metrics and model weights.\n  - Builds the BioAge regression model.\n- Using the updated models, the workflow calculates:\n  - The user's **SleepScore**\n  - The user's **BioAge sleep effect**\n- Google Gemini AI generates:\n  - A personalized sleep summary\n  - Interpretation of their SleepScore and BioAge effect\n  - Tailored recommendations\n- The workflow updates the Google Sheet with:\n  - SleepScore\n  - BioAge sleep effect\n  - Full sleep report\n",
+        "height": 432,
+        "width": 704
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -768,
+        1248
+      ],
+      "id": "686a823b-c51a-41aa-99e2-2ffb0c56f748",
+      "name": "Sticky Note"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        16,
+        1328
+      ],
+      "id": "b28355f5-88ca-4e30-8017-d2809b936b24",
+      "name": "Schedule Trigger2"
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "projectId": {
+          "__rl": true,
+          "value": "trume-labs",
+          "mode": "list",
+          "cachedResultName": "TruMe Labs",
+          "cachedResultUrl": "https://console.cloud.google.com/bigquery?project=trume-labs"
+        },
+        "sqlQuery": "SELECT\n  barcode,\n  sleep_hours,\n  trouble_sleeping,\n  waking_up_condition\nFROM `trume-labs.trume_dataset.participants_clean`\nWHERE Status = 'Todo'\nLIMIT 200;\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleBigQuery",
+      "typeVersion": 2.1,
+      "position": [
+        224,
+        1328
+      ],
+      "id": "7705f97b-b91b-433c-bfdf-3c54c9ce1cbc",
+      "name": "Execute a SQL query",
+      "credentials": {
+        "googleApi": {
+          "id": "GM7iM5vPVB3wOvJH",
+          "name": "Google Service Account account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        432,
+        1328
+      ],
+      "id": "ddd5c002-754f-439b-9e89-00a403f72f87",
+      "name": "Loop Over Items"
+    },
+    {
+      "parameters": {
+        "jsCode": "// n8n Code node (JavaScript) — paste this whole block.\n// Expects incoming JSON like:\n// { \"barcode\":\"101384\", \"sleep_hours\": null, \"trouble_sleeping\":\"No\", \"waking_up_condition\":\"Yes\", ...optional fields... }\n//\n// Optional inputs if available (recommended):\n// - sleep_mean, sleep_sd  (from your daily snapshot table)\n// - chronological_age, biological_sex (or sex)\n\nconst COEFS = {\n  Intercept: 17.7295,\n  SleepScore_z: -0.3332,\n  ActivityScore: -0.2574,\n  DietScore: 0.0554,\n  DiseaseScore: 0.3657,\n  StressScore: -0.1376,\n  MentalScore: 0.0625,\n  chronological_age: -0.3771,\n  sex_male: 0.1432,\n  sex_pnta: -5.3718,\n};\n\nfunction toNum(v) {\n  if (v === null || v === undefined) return null;\n  if (typeof v === \"number\" && Number.isFinite(v)) return v;\n  const s = String(v).trim();\n  if (!s) return null;\n  const n = Number(s);\n  return Number.isFinite(n) ? n : null;\n}\n\nfunction ynToBool(v) {\n  const s = String(v ?? \"\").trim().toLowerCase();\n  if ([\"yes\", \"y\", \"true\", \"1\"].includes(s)) return true;\n  if ([\"no\", \"n\", \"false\", \"0\"].includes(s)) return false;\n  return null; // unknown\n}\n\nfunction computeSleepScore(input) {\n  const sleepHours = toNum(input.sleep_hours);\n\n  // 1) Duration points (0–10)\n  // Neutral default if unknown (sleep_hours null)\n  let durationPoints = 5;\n\n  if (sleepHours !== null) {\n    if (sleepHours >= 7 && sleepHours <= 8) durationPoints = 10;\n    else if (sleepHours >= 6 && sleepHours < 7) durationPoints = 6;\n    else if (sleepHours > 8 && sleepHours <= 9) durationPoints = 6;\n    else durationPoints = 2;\n  }\n\n  // 2) Problems points (0–10)\n  // Start at 10, subtract penalties if problems are present.\n  let problemsPoints = 10;\n\n  const trouble = ynToBool(input.trouble_sleeping);\n  const waking = ynToBool(input.waking_up_condition);\n\n  // If unknown, don't penalize.\n  if (trouble === true) problemsPoints -= 4;\n\n  // Your input uses \"Yes\" / \"No\" for waking_up_condition.\n  // If \"Yes\" means \"waking up feeling bad\", penalize.\n  if (waking === true) problemsPoints -= 3;\n\n  problemsPoints = Math.max(0, Math.min(10, problemsPoints));\n\n  // 3) Weighted SleepScore (0–100)\n  const WEIGHT_DURATION = 0.4;\n  const WEIGHT_PROBLEMS = 0.6;\n\n  const raw = durationPoints * WEIGHT_DURATION + problemsPoints * WEIGHT_PROBLEMS;\n  const SleepScore = Math.max(0, Math.min(100, Math.round(raw * 10)));\n\n  return { SleepScore, durationPoints, problemsPoints, sleepHours };\n}\n\nfunction zScore(value, mean, sd) {\n  if (!Number.isFinite(value)) return 0;\n  if (!Number.isFinite(mean)) mean = 60;\n  if (!Number.isFinite(sd) || sd === 0) sd = 15;\n  return (value - mean) / sd;\n}\n\nfunction predictDeltaBioAge({\n  SleepScore_z,\n  ActivityScore = 0,\n  DietScore = 0,\n  DiseaseScore = 0,\n  StressScore = 0,\n  MentalScore = 0,\n  chronological_age,\n  sex = \"female\",\n}) {\n  const s = String(sex ?? \"female\").toLowerCase();\n  const sex_male = s === \"male\" ? 1 : 0;\n  const sex_pnta = s.includes(\"prefer\") ? 1 : 0;\n\n  const age = Number.isFinite(chronological_age) ? chronological_age : 0;\n\n  const yhat =\n    COEFS.Intercept +\n    COEFS.SleepScore_z * SleepScore_z +\n    COEFS.ActivityScore * ActivityScore +\n    COEFS.DietScore * DietScore +\n    COEFS.DiseaseScore * DiseaseScore +\n    COEFS.StressScore * StressScore +\n    COEFS.MentalScore * MentalScore +\n    COEFS.chronological_age * age +\n    COEFS.sex_male * sex_male +\n    COEFS.sex_pnta * sex_pnta;\n\n  return Math.round(yhat * 100) / 100;\n}\n\n// --------- n8n entrypoint ---------\nconst input = ($json && typeof $json === \"object\") ? $json : {};\n\n// Barcode (keep as string)\nconst barcode = String(input.barcode ?? \"\").trim();\n\n// Compute SleepScore\nconst sleep = computeSleepScore(input);\n\n// Pull mean/sd from snapshot if present; else defaults used\nconst sleep_mean = toNum(input.sleep_mean);\nconst sleep_sd = toNum(input.sleep_sd);\n\n// Compute z\nconst SleepScore_z = zScore(sleep.SleepScore, sleep_mean, sleep_sd);\n\n// Optional: If you have these fields from your pipeline/snapshot, pass them; else default 0\nconst ActivityScore = toNum(input.ActivityScore) ?? 0;\nconst DietScore = toNum(input.DietScore) ?? 0;\nconst DiseaseScore = toNum(input.DiseaseScore) ?? 0;\nconst StressScore = toNum(input.StressScore) ?? 0;\nconst MentalScore = toNum(input.MentalScore) ?? 0;\n\n// Chronological age + sex (use whichever field you have)\nconst chronological_age = toNum(input.chronological_age);\nconst sex = String(input.biological_sex ?? input.sex ?? \"female\");\n\n// Predict delta bioage (in years)\nconst deltaBioAge_pred = predictDeltaBioAge({\n  SleepScore_z,\n  ActivityScore,\n  DietScore,\n  DiseaseScore,\n  StressScore,\n  MentalScore,\n  chronological_age: chronological_age ?? 0,\n  sex,\n});\n\n// If you want just the \"BioAge_sleep_effect\" term like earlier (coef * z):\nconst BioAge_sleep_effect = Math.round((COEFS.SleepScore_z * SleepScore_z) * 1000) / 1000;\n\nreturn [\n  {\n    json: {\n      ok: Boolean(barcode),\n      barcode,\n      sleep_hours: sleep.sleepHours, // null if missing\n      durationPoints: sleep.durationPoints,\n      problemsPoints: sleep.problemsPoints,\n      SleepScore: sleep.SleepScore,\n      SleepScore_z: Math.round(SleepScore_z * 1000) / 1000,\n      BioAge_sleep_effect,           // sleep-only contribution\n      deltaBioAge_pred,              // full model prediction (years)\n    },\n  },\n];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        1328
+      ],
+      "id": "15893be0-9cb9-418c-8d30-6ac9564a7f30",
+      "name": "Code in JavaScript1"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ \n'You are a sleep health report generator. You will receive ONE JSON object with user sleep data.\\n\\n' +\n'Your task: Output ONLY a valid JSON array with ONE report object. No markdown, no backticks, no commentary.\\n\\n' +\n'RULES FOR NUMERIC VALUES:\\n' +\n'- Copy these EXACTLY from input: row_number, SleepScore, BioAge_sleep_effect, sleep_hours\\n' +\n'- NEVER change, round, or guess these values\\n' +\n'- If missing, use null\\n\\n' +\n'INPUT DATA STRUCTURE:\\n' +\n'The input will have fields like:\\n' +\n'- row_number (number)\\n' +\n'- SleepScore (number, 0-100)\\n' +\n'- BioAge_sleep_effect (number, can be negative or positive)\\n' +\n'- sleep_hours (number)\\n' +\n'- waking_up_condition (Yes or No)\\n' +\n'- trouble_sleeping (Yes or No)\\n\\n' +\n'CATEGORIZATION LOGIC:\\n\\n' +\n'SleepScore categories:\\n' +\n'- Excellent: 80 or higher\\n' +\n'- Good: 66-79\\n' +\n'- Average: 57-65\\n' +\n'- Below Average: 43-56\\n' +\n'- Poor: 42 or lower\\n' +\n'- Unknown: if missing\\n\\n' +\n'BioAge sleep effect categories (convert years to months):\\n' +\n'- Calculate months: round(abs(BioAge_sleep_effect) * 12, 1)\\n' +\n'- Excellent: -0.26 or lower (younger)\\n' +\n'- Good: -0.26 to -0.06 (younger)\\n' +\n'- Average: -0.06 to 0.06 (neutral)\\n' +\n'- Below Average: 0.06 to 0.26 (older)\\n' +\n'- Poor: above 0.26 (older)\\n' +\n'- Unknown: if missing\\n\\n' +\n'Sleep duration categories (using sleep_hours):\\n' +\n'- Very Short: under 5 hours\\n' +\n'- Short: 5 to 6.9 hours\\n' +\n'- Optimal: 7 to 8 hours\\n' +\n'- Long: 8 to 9.9 hours\\n' +\n'- Very Long: 10 or more hours\\n' +\n'- Unknown: if missing\\n\\n' +\n'Sleep problems level (based on yes or no answers):\\n' +\n'- None: both No\\n' +\n'- Medium: one Yes\\n' +\n'- High: both Yes\\n' +\n'- Unknown: if unclear\\n\\n' +\n'NARRATIVE GENERATION:\\n\\n' +\n'Write three paragraphs addressing the user as \"you\":\\n' +\n'1. intro_paragraph: State their SleepScore, category, and BioAge effect in months (younger, older, or neutral)\\n' +\n'2. sleep_pattern_paragraph: Discuss their sleep duration and problems, implications for health\\n' +\n'3. recommendations_paragraph: Provide tailored advice\\n\\n' +\n'Also create 3 to 6 specific recommendations in a list.\\n\\n' +\n'REQUIRED OUTPUT FORMAT:\\n\\n' +\n'Output ONLY this JSON structure (no markdown, no backticks, no extra text):\\n\\n' +\n'[\\n' +\n'  {\\n' +\n'    \"row_number\": <copy from input>,\\n' +\n'    \"headline\": \"<8-15 word summary>\",\\n' +\n'    \"sleep_score\": <copy exact number from SleepScore>,\\n' +\n'    \"sleep_score_category\": \"<your category>\",\\n' +\n'    \"bioage_sleep_effect_years\": <copy exact number from BioAge_sleep_effect>,\\n' +\n'    \"bioage_sleep_effect_months\": <calculate: abs(years) * 12, rounded to 1 decimal>,\\n' +\n'    \"bioage_sleep_category\": \"<your category>\",\\n' +\n'    \"sleep_duration_hours\": <copy exact number from sleep_hours>,\\n' +\n'    \"sleep_duration_category\": \"<your category>\",\\n' +\n'    \"sleep_problems_level\": \"<None/Medium/High/Unknown>\",\\n' +\n'    \"intro_paragraph\": \"<your text>\",\\n' +\n'    \"sleep_pattern_paragraph\": \"<your text>\",\\n' +\n'    \"recommendations_paragraph\": \"<your text>\",\\n' +\n'    \"recommendations_list\": [\\n' +\n'      \"Recommendation 1\",\\n' +\n'      \"Recommendation 2\",\\n' +\n'      \"Recommendation 3\"\\n' +\n'    ]\\n' +\n'  }\\n' +\n']\\n\\n' +\n'CRITICAL: Start your response with the opening bracket [. Do not add any text before or after the JSON array.\\n\\n' +\n'ACTUAL USER JSON (USE THIS DATA BELOW):\\n' +\nJSON.stringify($json, null, 2)\n}}\n",
+        "hasOutputParser": true,
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.7,
+      "position": [
+        976,
+        1424
+      ],
+      "id": "c0549fff-5514-4072-bcff-3792e1e016f3",
+      "name": "SleepScore Report Prompt2"
+    },
+    {
+      "parameters": {
+        "options": {
+          "maxOutputTokens": 3000,
+          "temperature": 0.1,
+          "topP": 0.8
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        976,
+        1568
+      ],
+      "id": "b1f21abc-cb8b-4478-b557-87c9df8b4368",
+      "name": "Google Gemini Chat Model2",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "qZEmLSkcqlFsOxnR",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        1296,
+        1344
+      ],
+      "id": "0f76cc8c-7862-4fa6-8b0d-f0d12d71547e",
+      "name": "Merge3"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Schedule Trigger2": {
+      "main": [
+        [
+          {
+            "node": "Execute a SQL query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute a SQL query": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Code in JavaScript1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript1": {
+      "main": [
+        [
+          {
+            "node": "SleepScore Report Prompt2",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Merge3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model2": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "SleepScore Report Prompt2",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SleepScore Report Prompt2": {
+      "main": [
+        [
+          {
+            "node": "Merge3",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "756f1077-126d-43cb-89de-f63b3599b542",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "9f65d1de108209ec46a801cb48812b1a1fe754417a806dbffe1a74da62df9826"
+  },
+  "id": "u9DwvUH3TzvXuJvY",
+  "tags": []
+}
